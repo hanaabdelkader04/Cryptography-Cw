@@ -4,69 +4,92 @@ import sys
 import signal
 import time
 import json
-from cryptography.hazmat.primitives.asymmetric import rsa, padding as rsa_padding
-from cryptography.hazmat.primitives import serialization, hashes
+import os
+import base64
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 
 MAX_LEN = 200
+AES_KEY = None  # Will be set after login
 exit_flag = False
 
-# Generate RSA key pair for the client
-private_key = rsa.generate_private_key(
-    public_exponent=65537,
-    key_size=2048,
-    backend=default_backend()
-)
-public_key = private_key.public_key()
+# AES Key Derivation (matching server's method)
+def derive_aes_key(password: str, salt: bytes):
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),  # Use hashes.SHA256 instead of SHA256
+        length=32,
+        salt=salt,
+        iterations=100000,
+        backend=default_backend()
+    )
+    return kdf.derive(password.encode())
 
-# Serialize the public key to send to the server
-public_key_pem = public_key.public_bytes(
-    encoding=serialization.Encoding.PEM,
-    format=serialization.PublicFormat.SubjectPublicKeyInfo
-).decode()
 
-# Decrypt received RSA-encrypted message
-def rsa_decrypt_message(encrypted_message):
-    return private_key.decrypt(
-        encrypted_message,
-        rsa_padding.OAEP(
-            mgf=rsa_padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None
-        )
-    ).decode()
+# AES encryption and decryption
+def encrypt_message(key, message):
+    iv = os.urandom(16)
+    padder = padding.PKCS7(128).padder()
+    padded_message = padder.update(message.encode()) + padder.finalize()
+    
+    cipher = Cipher(algorithms.AES(key), modes.CFB(iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+    encrypted_message = encryptor.update(padded_message) + encryptor.finalize()
+    
+    return base64.b64encode(iv + encrypted_message).decode()
 
-def send_message():
+def decrypt_message(key, encrypted_message):
+    encrypted_data = base64.b64decode(encrypted_message)
+    iv = encrypted_data[:16]
+    encrypted_message = encrypted_data[16:]
+    
+    cipher = Cipher(algorithms.AES(key), modes.CFB(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    padded_message = decryptor.update(encrypted_message) + decryptor.finalize()
+    
+    unpadder = padding.PKCS7(128).unpadder()
+    message = unpadder.update(padded_message) + unpadder.finalize()
+    
+    return message.decode()
+
+# Handle sending messages from the client
+def send_message(client_socket):
     global exit_flag
     while not exit_flag:
         try:
             message = input("You: ")
-            client_socket.sendall(message.encode())
             if message == "#exit":
                 exit_flag = True
+                client_socket.sendall(message.encode())
                 client_socket.close()
                 return
+            elif message.startswith("#history"):
+                target_user = message.split(" ")[1]
+                client_socket.sendall(message.encode())
+            else:
+                encrypted_message = encrypt_message(AES_KEY, message)
+                client_socket.sendall(encrypted_message.encode())
         except OSError:
-            return
+            print("Error sending message.")
+            break
 
-def recv_message():
+# Handle receiving messages from the server
+def recv_message(client_socket):
     global exit_flag
     while not exit_flag:
         try:
-            encrypted_message = client_socket.recv(MAX_LEN)
-            if not encrypted_message:
-                continue
-            try:
-                # Attempt to decrypt using the private key
-                message = rsa_decrypt_message(encrypted_message)
-                print(f"\r{message}")
-            except Exception as e:
-                print(f"\r[ERROR Decrypting]: {e}")
+            encrypted_message = client_socket.recv(MAX_LEN).decode()
+            if encrypted_message:
+                decrypted_message = decrypt_message(AES_KEY, encrypted_message)
+                print(f"\r{decrypted_message}")
             print("You: ", end="", flush=True)
         except:
             break
     print("Disconnected from server.")
 
+# Clean exit when Ctrl+C is pressed
 def signal_handler(sig, frame):
     global exit_flag
     if not exit_flag:
@@ -79,69 +102,58 @@ def signal_handler(sig, frame):
         client_socket.close()
         sys.exit(0)
 
-def login_or_register():
+# Handle user login or registration
+def login_or_register(client_socket):
     while True:
         choice = input("Type '1' to Login or '2' to Create a new account: ")
-        if choice not in ('1', '2'):
-            print("Invalid choice. Please enter '1' or '2'.")
+        if choice not in ['1', '2']:
+            print("Invalid choice. Please enter '1' for Login or '2' to Register.")
             continue
 
-        username = input("Enter your username: ")
-        password = input("Enter your password: ")
-        credentials = json.dumps({
+        username = input("Username: ")
+        password = input("Password: ")
+
+        action = "login" if choice == '1' else "register"
+        credentials = {
             "username": username,
             "password": password,
-            "action": "login" if choice == '1' else "register"
-        })
+            "action": action
+        }
 
-        client_socket.sendall(credentials.encode())
+        client_socket.sendall(json.dumps(credentials).encode())
         response = client_socket.recv(MAX_LEN).decode()
 
         if response == "LOGIN_SUCCESS":
-            print("\n\t  ====== Welcome to the chat-room ======   ")
-            return True
+            print("Login successful!")
+            AES_KEY = derive_aes_key(password, base64.b64decode(response.split(':')[1]))  # Get AES key from server
+            break
         elif response == "REGISTER_SUCCESS":
-            print("Account created successfully. You are now logged in!")
-            return True
-        elif response == "LOGIN_FAILED":
-            print("Login failed. Check your credentials.")
-        elif response == "REGISTER_FAILED":
-            print("Username already exists. Try again.")
+            print("Registration successful! You can now log in.")
+            break
         else:
-            print("Unknown error occurred.")
-    return False
+            print("Login/Registration failed. Please try again.")
 
+# Main function
 def main():
     global client_socket
-    signal.signal(signal.SIGINT, signal_handler)
+    global AES_KEY
 
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_address = ('127.0.0.1', 10000)
-    try:
-        client_socket.connect(server_address)
-    except ConnectionRefusedError:
-        print("Failed to connect to the server. Is it running?")
-        sys.exit(1)
+    client_socket.connect(('127.0.0.1', 10000))
 
-    # Send public key to server upon connecting
-    client_socket.sendall(public_key_pem.encode())
-    # Print the public key PEM to check its format before sending
-    print("Public Key PEM (client side):")
-    print(public_key_pem)
+    # Handle user login or registration
+    login_or_register(client_socket)
 
+    # Start threads for sending and receiving messages
+    threading.Thread(target=send_message, args=(client_socket,), daemon=True).start()
+    threading.Thread(target=recv_message, args=(client_socket,), daemon=True).start()
 
-    if not login_or_register():
-        client_socket.close()
-        sys.exit(0)
+    # Catch CTRL+C to exit cleanly
+    signal.signal(signal.SIGINT, signal_handler)
 
-    threading.Thread(target=send_message, daemon=True).start()
-    threading.Thread(target=recv_message, daemon=True).start()
-
-    try:
-        while not exit_flag:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        signal_handler(signal.SIGINT, None)
+    # Keep the client running
+    while not exit_flag:
+        time.sleep(1)
 
 if __name__ == "__main__":
     main()
